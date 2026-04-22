@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,12 +11,86 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/ark"
+	milvus2_retriever "github.com/cloudwego/eino-ext/components/retriever/milvus2"
+	"github.com/cloudwego/eino-ext/components/retriever/milvus2/search_mode"
 	"github.com/cloudwego/eino/schema"
 	"github.com/joho/godotenv"
-	//"github.com/milvus-io/milvus/client/v2/column"
-	//"github.com/milvus-io/milvus/client/v2/entity"
-	//"github.com/milvus-io/milvus/client/v2/milvusclient"
 )
+
+// 全局变量
+var (
+	globalRetriever *milvus2_retriever.Retriever
+	milvusEnabled   bool = false
+)
+
+// initMilvusGlobals 初始化 Milvus 相关全局变量
+func initMilvusGlobals(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("⚠️  Milvus 初始化失败: %v\n", r)
+			fmt.Printf("   将使用默认方式解卦\n")
+			milvusEnabled = false
+		}
+	}()
+
+	InitClient()
+	var err error
+	globalRetriever, err = milvus2_retriever.NewRetriever(ctx, &milvus2_retriever.RetrieverConfig{
+		Client:       MilvusCli,                  // 使用全局的 Milvus 客户端
+		Collection:   "Gua",                      // 你的 collection 名
+		TopK:         1,                          // 只返回1个结果
+		VectorField:  "vector",                   // 向量字段名
+		OutputFields: []string{"id", "metadata"}, // 需要的字段
+		SearchMode:   search_mode.NewScalar(),    // ⭐ 标量搜索模式！
+		// 注意：标量搜索不需要 Embedding！
+	})
+	if err != nil {
+		panic(fmt.Sprintf("创建 retriever 失败: %v", err))
+	}
+
+	milvusEnabled = true
+	fmt.Println("✅ Milvus 已启用（标量搜索模式）")
+}
+
+// GuaData 卦数据结构
+type GuaData struct {
+	Binary         string
+	Name           string
+	GuaText        string
+	GuaExplanation string
+}
+
+func searchGuaByBinary(ctx context.Context, binary string) (*schema.Document, error) {
+	targetID := "gua_" + binary
+	filterExpr := fmt.Sprintf(`id == "%s"`, targetID)
+
+	// 执行标量搜索
+	documents, err := globalRetriever.Retrieve(ctx, filterExpr)
+	if err != nil {
+		return nil, fmt.Errorf("查询失败: %w", err)
+	}
+
+	if len(documents) == 0 {
+		return nil, fmt.Errorf("未找到 id 为 %s 的卦", targetID)
+	}
+
+	doc := documents[0]
+
+	// 解析 metadata 中的字段到 MetaData 中
+	if metadataStr, ok := doc.MetaData["metadata"].(string); ok {
+		var meta GuaData
+		err := json.Unmarshal([]byte(metadataStr), &meta)
+		if err == nil {
+			// 把解析出来的字段放到 MetaData 中，方便后续使用
+			doc.MetaData["name"] = meta.Name
+			doc.MetaData["gua_text"] = meta.GuaText
+			doc.MetaData["gua_explanation"] = meta.GuaExplanation
+			doc.MetaData["binary"] = meta.Binary
+		}
+	}
+
+	return doc, nil
+}
 
 // createSlowStreamCallback 创建慢速流式输出回调（逐字输出）
 func createSlowStreamCallback() func(message string) {
@@ -60,6 +135,10 @@ func main() {
 
 	chatModel := NewArkModel(ctx)
 
+	// 初始化 Milvus（如果配置了）
+	fmt.Println("正在初始化 Milvus...")
+	initMilvusGlobals(ctx)
+
 	printWelcome()
 	reader := bufio.NewReader(os.Stdin)
 
@@ -87,49 +166,6 @@ func main() {
 			handleChat(ctx, chatModel, input)
 		}
 	}
-
-	// InitClient()
-	// embedder := NewArkEmbedder(ctx)
-
-	// indexer := NewArkIndexer(ctx, embedder)
-
-	// docs := []*schema.Document{
-	// 	{
-	// 		ID:      "",
-	// 		Content: "",
-	// 		MetaData: map[string]any{
-	// 			"author": "",
-	// 			"year":   ,
-	// 		},
-	// 	},
-	// }
-	// idx, err := indexer.Store(ctx, docs)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// fmt.Println(idx)
-
-	// searchMode := search_mode.NewApproximate(milvus2_retriever.IP)
-
-	// ret := NewArkRetriever(ctx, searchMode, embedder)
-
-	// query := ""
-	// fmt.Printf(query)
-
-	// Docs, err := ret.Retrieve(ctx, query,
-	// 	retriever.WithTopK(2),
-	// )
-	// if err != nil {
-	// 	panic(fmt.Sprintf("failed to retrieve: %v", err))
-	// }
-
-	// fmt.Printf("Found %d relevant documents:\n\n", len(docs))
-	// for i, doc := range Docs {
-	// 	fmt.Printf("--- Result %d ---\n", i+1)
-	// 	fmt.Printf("ID: %s\n", doc.ID)
-	// 	fmt.Printf("Content: %s\n", doc.Content)
-	// 	fmt.Printf("Metadata: %v\n\n", doc.MetaData)
-	// }
 }
 
 func handleDivination(ctx context.Context, chatModel *ark.ChatModel, input string) {
@@ -154,8 +190,30 @@ func handleDivination(ctx context.Context, chatModel *ark.ChatModel, input strin
 	// 输出卦象信息
 	printGuaInfo(streamCallback, gua)
 
+	// 从数据库搜索卦辞
+	binary := GetGuaBinary(gua)
+	var guaDoc *schema.Document
+	if milvusEnabled {
+		fmt.Print("\n--- 正在查询卦辞 ---\n\n")
+		guaDoc, err = searchGuaByBinary(ctx, binary)
+		if err != nil {
+			fmt.Printf("⚠️  查询卦辞失败: %v\n", err)
+			fmt.Println("   将使用默认方式解卦")
+		} else {
+			if name, ok := guaDoc.MetaData["name"]; ok {
+				fmt.Printf("   卦名: %s卦\n", name)
+			}
+			if guaText, ok := guaDoc.MetaData["gua_text"]; ok {
+				fmt.Printf("   卦辞: %s\n", guaText)
+			}
+			if guaExplanation, ok := guaDoc.MetaData["gua_explanation"]; ok {
+				fmt.Printf("   卦辞解释: %s\n", guaExplanation)
+			}
+		}
+	}
+
 	// 构建解卦提示并调用大模型
-	prompt := buildDivinationPrompt(question, gua)
+	prompt := buildDivinationPrompt(question, gua, guaDoc)
 	fmt.Print("\n--- 正在为您解卦 ---\n\n")
 	if err := callChatModelStream(ctx, chatModel, prompt); err != nil {
 		fmt.Printf("解卦失败: %v\n", err)
@@ -294,7 +352,7 @@ func containsDivinationKeywords(input string) bool {
 }
 
 // buildDivinationPrompt 构建解卦提示词
-func buildDivinationPrompt(question string, gua []Yao) string {
+func buildDivinationPrompt(question string, gua []Yao, guaDoc *schema.Document) string {
 	binary := GetGuaBinary(gua)
 	yaoDetails := buildYaoDetails(gua)
 	changingPositions := GetChangingYaoPositions(gua)
@@ -317,6 +375,24 @@ func buildDivinationPrompt(question string, gua []Yao) string {
 	additionalInfo := buildAdditionalInfo(huLower, huUpper, wuXingStats, bestMonth)
 	ruleText := buildRuleText(changeCount, changingPositions, unchangingPositions, bianBinary)
 
+	// 构建卦辞部分
+	var guaCiSection string
+	if guaDoc != nil {
+		guaCiSection = "【卦辞原文】\n"
+		if name, ok := guaDoc.MetaData["name"]; ok {
+			guaCiSection += fmt.Sprintf("卦名：%s卦\n", name)
+		}
+		if guaText, ok := guaDoc.MetaData["gua_text"]; ok {
+			guaCiSection += fmt.Sprintf("卦辞：%s\n", guaText)
+		}
+		if guaExplanation, ok := guaDoc.MetaData["gua_explanation"]; ok {
+			guaCiSection += fmt.Sprintf("卦辞解释：%s\n", guaExplanation)
+		}
+		guaCiSection += "\n"
+	} else {
+		guaCiSection = ""
+	}
+
 	return fmt.Sprintf(`你是一位精通周易的算卦大师。请根据以下揲蓍布卦的结果，为用户的问题提供专业的解卦指导。
 
 【用户问题】
@@ -330,6 +406,7 @@ func buildDivinationPrompt(question string, gua []Yao) string {
 本卦各爻详情:
 %s
 
+%s
 %s
 
 %s
@@ -345,7 +422,7 @@ func buildDivinationPrompt(question string, gua []Yao) string {
 8. 解释卦象的吉凶属性和注意事项
 9. 给出行动建议和启示
 
-请以专业、客观、有启发性的方式回答。并在回答结束后提醒用户占卜没有科学依据，仅供娱乐参考`, questionText, binary, upperTrigram, lowerTrigram, yaoDetails, additionalInfo, ruleText)
+请以专业、客观、有启发性的方式回答。并在回答结束后提醒用户占卜没有科学依据，仅供娱乐参考`, questionText, binary, upperTrigram, lowerTrigram, yaoDetails, guaCiSection, additionalInfo, ruleText)
 }
 
 func buildYaoDetails(gua []Yao) string {

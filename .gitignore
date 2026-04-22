@@ -4,8 +4,6 @@
 *.dll
 *.so
 *.dylib
-zhouyi
-divination
 
 # Test binary, built with `go test -c`
 *.test
@@ -22,28 +20,21 @@ go.work
 # Environment variables
 .env
 .env.local
-.env.*.local
 
-# IDE and editor files
-.vscode/
+# IDE and editor
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Milvus volumes (Docker)
+# OS files
+.DS_Store
+Thumbs.db
+
+# Milvus data (if using local volumes)
 volumes/
 
-# Log files
-*.log
-logs/
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-
 # Build artifacts
-dist/
-build/
+zhouyi
+eino-app
