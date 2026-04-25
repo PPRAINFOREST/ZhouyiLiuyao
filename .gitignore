@@ -38,3 +38,5 @@ volumes/
 # Build artifacts
 zhouyi
 eino-app
+
+gua_collection.json

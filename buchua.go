@@ -64,12 +64,54 @@ func randNormInt(r *rand.Rand, min, max int) int {
 	}
 }
 
-// DiceBuchguaStream 揲蓍布卦主函数（流式输出版本）
+// DiceBuchguaStream 揲蓍布卦主函数（流式输出版本，兼容旧版）
+// 为了保持兼容性，内部调用 DiceBuchgua 和 PrintBuchguaProcess
 func DiceBuchguaStream(callback StreamCallback, question string) []Yao {
+	// 先计算卦象
+	gua := DiceBuchgua(question)
+
+	// 再输出算卦过程
+	PrintBuchguaProcess(callback, question, gua)
+
+	return gua
+}
+
+// DiceBuchgua 揲蓍布卦主函数（只计算，不输出）
+// 返回卦象（6个爻），用于后续并行处理
+func DiceBuchgua(question string) []Yao {
 	var gua []Yao
 
 	localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	for range 6 {
+		rest := 49
+		var bian int
+
+		// 三变
+		for bianCount := 1; bianCount <= 3; bianCount++ {
+			x := randNormInt(localRand, 1, rest-1)
+
+			if bianCount == 1 {
+				bian = (x-1)%4 + (47-x)%4 + 3
+				rest = 49 - bian
+			} else {
+				bian = (x-1)%4 + (rest-2-x)%4 + 3
+				rest = rest - bian
+			}
+		}
+
+		// 确定爻的数值 (9, 8, 7, 6)
+		resultNum := rest / 4
+		yao := numberToYao(resultNum)
+		gua = append(gua, yao)
+	}
+
+	return gua
+}
+
+// PrintBuchguaProcess 输出算卦过程（只输出，不计算）
+// 接收已计算好的卦象，用于在后台算卦完成后再输出仪式感内容
+func PrintBuchguaProcess(callback StreamCallback, question string, gua []Yao) {
 	// 输出占卜祈词
 	callback("\n下面我将为您占卜，请您面向北方，并将屏幕置于面前……\n")
 	time.Sleep(1500 * time.Millisecond)
@@ -87,12 +129,15 @@ func DiceBuchguaStream(callback StreamCallback, question string) []Yao {
 		yaoName := GetYaoName(i)
 		callback(fmt.Sprintf("【%s起卦】\n", yaoName))
 
+		// 模拟三变过程（随机数已经算好，这里只输出）
 		rest := 49
 		var bian int
 
-		// 三变
 		for bianCount := 1; bianCount <= 3; bianCount++ {
 			callback(fmt.Sprintf("  第%d揲：分二、挂一、揲四、归奇...\n", bianCount))
+
+			// 重新计算用于显示的随机数（只用于演示，不影响卦象）
+			localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(i*1000+bianCount)))
 			x := randNormInt(localRand, 1, rest-1)
 
 			if bianCount == 1 {
@@ -106,23 +151,19 @@ func DiceBuchguaStream(callback StreamCallback, question string) []Yao {
 			callback(fmt.Sprintf("    挂揲数: %d，剩余: %d\n\n", bian, rest))
 		}
 
-		// 确定爻的数值 (9, 8, 7, 6)
-		resultNum := rest / 4
-		yao := numberToYao(resultNum)
+		// 输出实际的爻（使用已经计算好的卦象）
+		yao := gua[i]
 		symbol := "--  --"
 		if yao.IsYang {
 			symbol = "------"
 		}
 
 		callback(fmt.Sprintf("  %s成：%s %s\n\n", yaoName, symbol, yao.String()))
-		gua = append(gua, yao)
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	callback(strings.Repeat("=", 50) + "\n")
 	callback("卦象已完成！\n\n")
-
-	return gua
 }
 
 // GetFormattedYaoName 获取格式化的爻名（如"初七"、"六二"、"九三"、"六四"、"八五"、"上八"）

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/ark"
@@ -23,7 +24,20 @@ var (
 	milvusEnabled   bool = false
 )
 
-// initMilvusGlobals 初始化 Milvus 相关全局变量
+// DivinationResult 后台执行流的结果
+type DivinationResult struct {
+	guaDoc *schema.Document
+	err    error
+}
+
+// GuaData 卦数据结构
+type GuaData struct {
+	Binary         string
+	Name           string
+	GuaText        string
+	GuaExplanation string
+}
+
 func initMilvusGlobals(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -36,13 +50,12 @@ func initMilvusGlobals(ctx context.Context) {
 	InitClient()
 	var err error
 	globalRetriever, err = milvus2_retriever.NewRetriever(ctx, &milvus2_retriever.RetrieverConfig{
-		Client:       MilvusCli,                  // 使用全局的 Milvus 客户端
-		Collection:   "Gua",                      // 你的 collection 名
-		TopK:         1,                          // 只返回1个结果
-		VectorField:  "vector",                   // 向量字段名
-		OutputFields: []string{"id", "metadata"}, // 需要的字段
-		SearchMode:   search_mode.NewScalar(),    // ⭐ 标量搜索模式！
-		// 注意：标量搜索不需要 Embedding！
+		Client:       MilvusCli,
+		Collection:   "Gua",
+		TopK:         1,
+		VectorField:  "vector",
+		OutputFields: []string{"id", "metadata"},
+		SearchMode:   search_mode.NewScalar(),
 	})
 	if err != nil {
 		panic(fmt.Sprintf("创建 retriever 失败: %v", err))
@@ -52,19 +65,10 @@ func initMilvusGlobals(ctx context.Context) {
 	fmt.Println("✅ Milvus 已启用（标量搜索模式）")
 }
 
-// GuaData 卦数据结构
-type GuaData struct {
-	Binary         string
-	Name           string
-	GuaText        string
-	GuaExplanation string
-}
-
 func searchGuaByBinary(ctx context.Context, binary string) (*schema.Document, error) {
 	targetID := "gua_" + binary
 	filterExpr := fmt.Sprintf(`id == "%s"`, targetID)
 
-	// 执行标量搜索
 	documents, err := globalRetriever.Retrieve(ctx, filterExpr)
 	if err != nil {
 		return nil, fmt.Errorf("查询失败: %w", err)
@@ -76,12 +80,10 @@ func searchGuaByBinary(ctx context.Context, binary string) (*schema.Document, er
 
 	doc := documents[0]
 
-	// 解析 metadata 中的字段到 MetaData 中
 	if metadataStr, ok := doc.MetaData["metadata"].(string); ok {
 		var meta GuaData
 		err := json.Unmarshal([]byte(metadataStr), &meta)
 		if err == nil {
-			// 把解析出来的字段放到 MetaData 中，方便后续使用
 			doc.MetaData["name"] = meta.Name
 			doc.MetaData["gua_text"] = meta.GuaText
 			doc.MetaData["gua_explanation"] = meta.GuaExplanation
@@ -92,7 +94,6 @@ func searchGuaByBinary(ctx context.Context, binary string) (*schema.Document, er
 	return doc, nil
 }
 
-// createSlowStreamCallback 创建慢速流式输出回调（逐字输出）
 func createSlowStreamCallback() func(message string) {
 	return func(message string) {
 		for _, char := range message {
@@ -160,18 +161,68 @@ func main() {
 			break
 		}
 
+		// ⭐ 开始计时
+		startTime := time.Now()
+
 		if containsDivinationKeywords(input) {
 			handleDivination(ctx, chatModel, input)
 		} else {
 			handleChat(ctx, chatModel, input)
 		}
+
+		// ⭐ 输出耗时
+		duration := time.Since(startTime)
+		seconds := duration.Seconds()
+
+		fmt.Printf("\n⏱️  本次对话耗时: %.2f秒\n", seconds)
 	}
 }
 
+// GuaAnalysisContext 卦象分析上下文，用于复用计算结果
+type GuaAnalysisContext struct {
+	binary            string
+	upperTrigram      string
+	lowerTrigram      string
+	huLower           string
+	huUpper           string
+	hasChangingYao    bool
+	wuXingStats       TrigramStats
+	bestMonth         string
+	changingPositions []int
+	changeCount       int
+}
+
+// buildGuaAnalysisContext 构建卦象分析上下文（一次性计算所有需要的值）
+func buildGuaAnalysisContext(gua []Yao) GuaAnalysisContext {
+	binary := GetGuaBinary(gua)
+	upperTrigram := GetUpperTrigram(gua)
+	lowerTrigram := GetLowerTrigram(gua)
+	huLower, huUpper := GetHuGua(gua)
+	hasChangingYao := HasChangingYao(gua)
+	wuXingStats := AnalyzeWuXing(gua, hasChangingYao)
+	bestMonth := wuXingStats.GetBestLunarMonth()
+	changingPositions := GetChangingYaoPositions(gua)
+	changeCount := len(changingPositions)
+
+	return GuaAnalysisContext{
+		binary:            binary,
+		upperTrigram:      upperTrigram,
+		lowerTrigram:      lowerTrigram,
+		huLower:           huLower,
+		huUpper:           huUpper,
+		hasChangingYao:    hasChangingYao,
+		wuXingStats:       wuXingStats,
+		bestMonth:         bestMonth,
+		changingPositions: changingPositions,
+		changeCount:       changeCount,
+	}
+}
+
+// handleDivination 处理算卦（修复版本）
 func handleDivination(ctx context.Context, chatModel *ark.ChatModel, input string) {
 	question := extractQuestion(input)
 
-	// 用AI总结问题（用于占卜祈词）
+	// 第1步：大模型总结问题（较慢）
 	var questionSummary string
 	var err error
 	if question != "" {
@@ -182,54 +233,144 @@ func handleDivination(ctx context.Context, chatModel *ark.ChatModel, input strin
 			questionSummary = "诸事吉凶"
 		}
 	}
+
+	// 第2步：随机生成六爻（很快）
+	gua := DiceBuchgua(questionSummary)
+
+	// 第3步：一次性计算所有卦象分析（避免重复计算）⭐
+	analysisContext := buildGuaAnalysisContext(gua)
+
+	// 第4步：并行执行两个执行流 ⭐
+	// 创建 channel 用于同步
+	resultChan := make(chan DivinationResult, 1)
+	divinationReader, divinationWriter := io.Pipe()
+	divinationReadyChan := make(chan bool, 1)
+
+	// 使用 WaitGroup 等待后台解卦完成 ⭐
+	var wg sync.WaitGroup
+
+	// 【后台执行流】查询卦辞 -> 调用大模型解卦（流式输出到 pipe）
+	wg.Add(1) // 标记后台任务开始
+	go func() {
+		defer wg.Done() // 标记后台任务完成
+		defer divinationWriter.Close()
+
+		// 查询卦辞（较快）
+		var guaDoc *schema.Document
+		var err error
+		if milvusEnabled {
+			guaDoc, err = searchGuaByBinary(ctx, analysisContext.binary)
+			if err != nil {
+				guaDoc = nil
+				err = nil // 不影响后续流程
+			}
+		}
+
+		// 发送卦辞结果到主线程（使用 DivinationResult 结构）⭐
+		resultChan <- DivinationResult{guaDoc, err}
+
+		// 等待前台准备好接收流式输出
+		<-divinationReadyChan
+
+		// 构建 prompt（使用预先计算的上下文，避免重复计算）⭐
+		prompt := buildDivinationPrompt(question, gua, guaDoc, analysisContext)
+
+		// 调用大模型解卦（流式输出到 pipe）⭐
+		messages := []*schema.Message{
+			schema.SystemMessage("你是一位精通周易、卜卦、传统文化和哲学的算卦大师。你具备深厚的周易知识，能够准确解读卦象，为人们提供有价值的指导。你的回答应该专业、客观、有启发性，同时通俗易懂。并要在解卦后提醒用户占卜并不具有科学依据，仅供娱乐用。"),
+			schema.UserMessage(prompt),
+		}
+
+		reader, err := chatModel.Stream(ctx, messages)
+		if err != nil {
+			divinationWriter.Write([]byte(fmt.Sprintf("解卦失败: %v\n", err)))
+		} else {
+			for {
+				chunk, err := reader.Recv()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					divinationWriter.Write([]byte(fmt.Sprintf("读取流式输出失败: %v\n", err)))
+					break
+				}
+				if chunk.Content != "" {
+					divinationWriter.Write([]byte(chunk.Content))
+				}
+			}
+			reader.Close()
+		}
+	}()
+
+	// 【前台执行流】输出算卦过程 -> 输出卦象结构分析
 	streamCallback := createSlowStreamCallback()
 
-	// 进行揲蓍布卦
-	gua := DiceBuchguaStream(streamCallback, questionSummary)
+	// 输出算卦过程
+	PrintBuchguaProcess(streamCallback, questionSummary, gua)
 
-	// 输出卦象信息
-	printGuaInfo(streamCallback, gua)
+	// 输出卦象结构分析（使用预先计算的上下文）⭐
+	printGuaInfoWithContext(streamCallback, gua, analysisContext)
 
-	// 从数据库搜索卦辞
-	binary := GetGuaBinary(gua)
-	var guaDoc *schema.Document
-	if milvusEnabled {
+	// 第5步：等待后台准备好卦辞
+	result := <-resultChan
+
+	// 流式输出卦辞
+	if milvusEnabled && result.guaDoc != nil {
 		fmt.Print("\n--- 正在查询卦辞 ---\n\n")
-		guaDoc, err = searchGuaByBinary(ctx, binary)
-		if err != nil {
-			fmt.Printf("⚠️  查询卦辞失败: %v\n", err)
-			fmt.Println("   将使用默认方式解卦")
-		} else {
-			if name, ok := guaDoc.MetaData["name"]; ok {
-				fmt.Printf("   卦名: %s卦\n", name)
-			}
-			if guaText, ok := guaDoc.MetaData["gua_text"]; ok {
-				fmt.Printf("   卦辞: %s\n", guaText)
-			}
-			if guaExplanation, ok := guaDoc.MetaData["gua_explanation"]; ok {
-				fmt.Printf("   卦辞解释: %s\n", guaExplanation)
-			}
+		slowStreamCallback := createSlowStreamCallback()
+		if name, ok := result.guaDoc.MetaData["name"]; ok {
+			slowStreamCallback(fmt.Sprintf("   卦名: %s卦\n", name))
+		}
+		if guaText, ok := result.guaDoc.MetaData["gua_text"]; ok {
+			slowStreamCallback(fmt.Sprintf("   卦辞: %s\n", guaText))
+		}
+		if guaExplanation, ok := result.guaDoc.MetaData["gua_explanation"]; ok {
+			slowStreamCallback(fmt.Sprintf("   象/彖: %s\n", guaExplanation))
 		}
 	}
 
-	// 构建解卦提示并调用大模型
-	prompt := buildDivinationPrompt(question, gua, guaDoc)
+	// 第6步：流式输出解卦结果
 	fmt.Print("\n--- 正在为您解卦 ---\n\n")
-	if err := callChatModelStream(ctx, chatModel, prompt); err != nil {
-		fmt.Printf("解卦失败: %v\n", err)
-	}
+
+	// 通知后台可以开始流式输出了
+	divinationReadyChan <- true
+
+	// 从 pipe 中流式读取并输出解卦结果
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := divinationReader.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					fmt.Printf("\n读取解卦结果失败: %v\n", err)
+				}
+				break
+			}
+			if n > 0 {
+				fmt.Print(string(buf[:n]))
+				os.Stdout.Sync()
+			}
+		}
+		divinationReader.Close()
+	}()
+
+	// 等待后台解卦完成 ⭐
+	wg.Wait()
+
+	// 确保所有解卦内容都已输出
+	time.Sleep(100 * time.Millisecond)
 	fmt.Println()
 }
 
-func printGuaInfo(callback func(string), gua []Yao) {
+// printGuaInfoWithContext 输出卦象信息（使用预先计算的上下文，避免重复计算）⭐
+func printGuaInfoWithContext(callback func(string), gua []Yao, ctx GuaAnalysisContext) {
 	callback("\n" + strings.Repeat("=", 50) + "\n")
 	callback("完整卦象\n")
 	callback(strings.Repeat("=", 50) + "\n")
 	callback(FormatGua(gua))
 
-	if HasChangingYao(gua) {
-		positions := GetChangingYaoPositions(gua)
-		callback(fmt.Sprintf("变爻位置: %v\n", GetFormattedChangingPositions(positions)))
+	if ctx.hasChangingYao {
+		callback(fmt.Sprintf("变爻位置: %v\n", GetFormattedChangingPositions(ctx.changingPositions)))
 	} else {
 		callback("本卦无变爻\n")
 	}
@@ -237,10 +378,8 @@ func printGuaInfo(callback func(string), gua []Yao) {
 	callback(strings.Repeat("=", 50) + "\n")
 	callback("\n" + GetTrigramAnalysis(gua))
 
-	hasChangingYao := HasChangingYao(gua)
-	wuXingStats := AnalyzeWuXing(gua, hasChangingYao)
-	callback(wuXingStats.String())
-	callback(fmt.Sprintf("\n最佳农历月份：%s\n", wuXingStats.GetBestLunarMonth()))
+	callback(ctx.wuXingStats.String())
+	callback(fmt.Sprintf("\n最佳农历月份：%s\n", ctx.bestMonth))
 	callback("\n" + strings.Repeat("=", 50) + "\n")
 }
 
@@ -252,7 +391,6 @@ func handleChat(ctx context.Context, chatModel *ark.ChatModel, input string) {
 	fmt.Print("\n")
 }
 
-// extractQuestion 从用户输入中提取问题（去除算卦关键词）
 func extractQuestion(input string) string {
 	keywords := []string{"算卦", "起卦", "占卜", "卜卦", "揲蓍", "布卦", "算一算", "算一下"}
 	question := input
@@ -266,7 +404,6 @@ func extractQuestion(input string) string {
 	return question
 }
 
-// summarizeQuestion 用AI将问题总结为简洁的短语（用于占卜祈词）
 func summarizeQuestion(ctx context.Context, model *ark.ChatModel, question string) (string, error) {
 	if question == "" {
 		return "", nil
@@ -309,10 +446,9 @@ func summarizeQuestion(ctx context.Context, model *ark.ChatModel, question strin
 	return summary, nil
 }
 
-// callChatModelStream 调用大模型（流式输出版本）
 func callChatModelStream(ctx context.Context, model *ark.ChatModel, prompt string) error {
 	messages := []*schema.Message{
-		schema.SystemMessage("你是一位精通周易、卜卦、传统文化和哲学的算卦大师。你具备深厚的周易知识，能够准确解读卦象，为人们提供有价值的指导。你的回答应该专业、客观、有启发性，同时通俗易懂。并要在解卦后提醒用户占卦并不具有科学依据，仅供娱乐用。"),
+		schema.SystemMessage("你是一位精通周易、卜卦、传统文化和哲学的算卦大师。你具备深厚的周易知识，能够准确解读卦象，为人们提供有价值的指导。你的回答应该专业、客观、有启发性，同时通俗易懂。并要在解卦后提醒用户占卜并不具有科学依据，仅供娱乐用。"),
 		schema.UserMessage(prompt),
 	}
 
@@ -333,13 +469,12 @@ func callChatModelStream(ctx context.Context, model *ark.ChatModel, prompt strin
 
 		if chunk.Content != "" {
 			fmt.Print(chunk.Content)
-			os.Stdout.Sync() // 立即输出
+			os.Stdout.Sync()
 		}
 	}
 	return nil
 }
 
-// containsDivinationKeywords 检查输入是否包含算卦关键词
 func containsDivinationKeywords(input string) bool {
 	keywords := []string{"算卦", "起卦", "占卜", "卜卦", "揲蓍", "布卦", "算一下", "算一算"}
 	input = strings.ToLower(input)
@@ -351,29 +486,20 @@ func containsDivinationKeywords(input string) bool {
 	return false
 }
 
-// buildDivinationPrompt 构建解卦提示词
-func buildDivinationPrompt(question string, gua []Yao, guaDoc *schema.Document) string {
-	binary := GetGuaBinary(gua)
+// buildDivinationPrompt 构建解卦提示词（使用预先计算的上下文，避免重复计算）⭐
+func buildDivinationPrompt(question string, gua []Yao, guaDoc *schema.Document, ctx GuaAnalysisContext) string {
 	yaoDetails := buildYaoDetails(gua)
-	changingPositions := GetChangingYaoPositions(gua)
-	changeCount := len(changingPositions)
 	unchangingPositions := GetUnchangingYaoPositions(gua)
 	bianGua := CalculateBianGua(gua)
 	bianBinary := GetGuaBinary(bianGua)
-	upperTrigram := GetUpperTrigram(gua)
-	lowerTrigram := GetLowerTrigram(gua)
-	huLower, huUpper := GetHuGua(gua)
-	hasChangingYao := HasChangingYao(gua)
-	wuXingStats := AnalyzeWuXing(gua, hasChangingYao)
-	bestMonth := wuXingStats.GetBestLunarMonth()
 
 	questionText := "无具体问题"
 	if question != "" {
 		questionText = question
 	}
 
-	additionalInfo := buildAdditionalInfo(huLower, huUpper, wuXingStats, bestMonth)
-	ruleText := buildRuleText(changeCount, changingPositions, unchangingPositions, bianBinary)
+	additionalInfo := buildAdditionalInfo(ctx.huLower, ctx.huUpper, ctx.wuXingStats, ctx.bestMonth)
+	ruleText := buildRuleText(ctx.changeCount, ctx.changingPositions, unchangingPositions, bianBinary)
 
 	// 构建卦辞部分
 	var guaCiSection string
@@ -386,7 +512,7 @@ func buildDivinationPrompt(question string, gua []Yao, guaDoc *schema.Document) 
 			guaCiSection += fmt.Sprintf("卦辞：%s\n", guaText)
 		}
 		if guaExplanation, ok := guaDoc.MetaData["gua_explanation"]; ok {
-			guaCiSection += fmt.Sprintf("卦辞解释：%s\n", guaExplanation)
+			guaCiSection += fmt.Sprintf("象/彖：%s\n", guaExplanation)
 		}
 		guaCiSection += "\n"
 	} else {
@@ -422,7 +548,7 @@ func buildDivinationPrompt(question string, gua []Yao, guaDoc *schema.Document) 
 8. 解释卦象的吉凶属性和注意事项
 9. 给出行动建议和启示
 
-请以专业、客观、有启发性的方式回答。并在回答结束后提醒用户占卜没有科学依据，仅供娱乐参考`, questionText, binary, upperTrigram, lowerTrigram, yaoDetails, guaCiSection, additionalInfo, ruleText)
+请以专业、客观、有启发性的方式回答。并在回答结束后提醒用户占卜没有科学依据，仅供娱乐参考`, questionText, ctx.binary, ctx.upperTrigram, ctx.lowerTrigram, yaoDetails, guaCiSection, additionalInfo, ruleText)
 }
 
 func buildYaoDetails(gua []Yao) string {
